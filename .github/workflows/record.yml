@@ -1,0 +1,66 @@
+# Nightly NBA recording: live scores from several free feeds and Kalshi's public game-winner prices, side by
+# side on one clock, for latency research. Public data only; nothing here places, sizes or suggests a trade.
+#   tools/recorder.py   ESPN scoreboard + each live game's Kalshi orderbook every 2 s  -> data/nba-YYYYMMDD.jsonl.gz
+#   tools/feed_race.py  ESPN scoreboard, ESPN core API, NBA live data, Kalshi orderbook every 1 s -> data/race-YYYYMMDD.jsonl.gz
+# Each run records until every game is final (or the time limit) and commits the night's files.
+name: Record NBA night
+
+on:
+  schedule:
+    - cron: "40 22 * * *"   # 6:40 PM EDT / 5:40 PM EST; most tip-offs are 7:00-10:30 PM ET
+    - cron: "30 3 * * *"    # 11:30 PM EDT backup: GitHub's schedule can fire hours late; finishes late games
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "hours to record"
+        default: "5.5"
+
+concurrency:
+  group: record
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Record (both recorders in parallel)
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          # the slate's date: a run that starts after midnight ET (late or queued) still belongs to last night
+          DAY=$(TZ=America/New_York date -d '-6 hours' +%Y%m%d)
+          echo "DAY=$DAY" >> "$GITHUB_ENV"
+          H="${{ github.event.inputs.hours || '5.5' }}"
+          python tools/recorder.py --hours "$H" --every 2 --date "$DAY" --out "data/nba-$DAY.jsonl.gz" &
+          python tools/feed_race.py record --hours "$H" --out "data/race-$DAY.jsonl.gz" &
+          wait
+      - name: Commit the night's files (retries if main moved)
+        if: always()
+        run: |
+          ls data/*-"$DAY".jsonl.gz >/dev/null 2>&1 || { echo "nothing recorded"; exit 0; }
+          git config user.name "nba-recorder"
+          git config user.email "nba-recorder@users.noreply.github.com"
+          mkdir -p "$RUNNER_TEMP/keep" && cp data/*-"$DAY".jsonl.gz "$RUNNER_TEMP/keep/"
+          for attempt in 1 2 3; do
+            git fetch -q origin main && git reset -q --hard origin/main
+            cp "$RUNNER_TEMP"/keep/* data/
+            git add data/
+            git diff --cached --quiet && { echo "nothing changed"; exit 0; }
+            git commit -q -m "Recording $DAY ($(TZ=America/New_York date '+%Y-%m-%d %H:%M') ET)"
+            git push -q origin HEAD:main && { echo "pushed"; exit 0; }
+            echo "push rejected; redoing on the latest main"
+            sleep 10
+          done
+          exit 1
