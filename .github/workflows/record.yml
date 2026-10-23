@@ -2,6 +2,7 @@
 # side on one clock, for latency research. Public data only; nothing here places, sizes or suggests a trade.
 #   tools/recorder.py   ESPN scoreboard + each live game's Kalshi orderbook every 2 s  -> data/nba-YYYYMMDD.jsonl.gz
 #   tools/feed_race.py  ESPN scoreboard, ESPN core API, NBA live data, Kalshi orderbook every 1 s -> data/race-YYYYMMDD.jsonl.gz
+#   tools/trades_bundle.py  the night's Kalshi trade prints (time, price) for each recorded game -> data/trades-YYYYMMDD.json.gz
 # Each run records until every game is final (or 5.5 h) and commits the night's files; runs start six times a day.
 name: Record NBA night
 
@@ -52,6 +53,13 @@ jobs:
           python tools/recorder.py --hours "$H" --every 2 --date "$DAY" --out "data/nba-$DAY.jsonl.gz" &
           python tools/feed_race.py record --hours "$H" --out "data/race-$DAY.jsonl.gz" &
           wait
+      - name: Pack the night's Kalshi trades (Kalshi refuses Claude's cloud, so the analyst reads them from here)
+        if: always()
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          [ -f "data/nba-$DAY.jsonl.gz" ] || { echo "no recording"; exit 0; }
+          timeout 600 python tools/trades_bundle.py pack "data/nba-$DAY.jsonl.gz" "$DAY" "data/trades-$DAY.json.gz" || echo "trade pack failed (recording still saved)"
       - name: Commit the night's files (retries if main moved)
         if: always()
         run: |
