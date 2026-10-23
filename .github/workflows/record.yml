@@ -2,17 +2,22 @@
 # side on one clock, for latency research. Public data only; nothing here places, sizes or suggests a trade.
 #   tools/recorder.py   ESPN scoreboard + each live game's Kalshi orderbook every 2 s  -> data/nba-YYYYMMDD.jsonl.gz
 #   tools/feed_race.py  ESPN scoreboard, ESPN core API, NBA live data, Kalshi orderbook every 1 s -> data/race-YYYYMMDD.jsonl.gz
-# Each run records until every game is final (or the time limit) and commits the night's files.
+# Each run records until every game is final (or 5.5 h) and commits the night's files; runs start six times a day.
 name: Record NBA night
 
 on:
-  schedule:
-    - cron: "40 22 * * *"   # 6:40 PM EDT / 5:40 PM EST; most tip-offs are 7:00-10:30 PM ET
-    - cron: "30 3 * * *"    # 11:30 PM EDT backup: GitHub's schedule can fire hours late; finishes late games
+  schedule:   # GitHub fires crons up to hours late (10-22: 6:40 PM fired 8:54 PM, 11:30 PM fired 4:45 AM), so start
+              # often: each run records up to 5.5 h; the concurrency group queues the next one, so runs chain
+    - cron: "0 16 * * *"    # noon EDT (weekend matinees)
+    - cron: "0 19 * * *"    # 3 PM EDT
+    - cron: "0 22 * * *"    # 6 PM EDT; most tip-offs are 7:00-10:30 PM ET
+    - cron: "0 0 * * *"     # 8 PM EDT
+    - cron: "0 2 * * *"     # 10 PM EDT
+    - cron: "0 4 * * *"     # midnight EDT: finishes late games
   workflow_dispatch:
     inputs:
       hours:
-        description: "hours to record"
+        description: "hours to record (capped at 5.5: GitHub kills a job at 6 h, before it can save)"
         default: "5.5"
 
 concurrency:
@@ -25,7 +30,7 @@ permissions:
 jobs:
   record:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
         with:
@@ -43,6 +48,7 @@ jobs:
           DAY=$(TZ=America/New_York date -d '-6 hours' +%Y%m%d)
           echo "DAY=$DAY" >> "$GITHUB_ENV"
           H="${{ github.event.inputs.hours || '5.5' }}"
+          H=$(python -c "print(min(float('$H'), 5.5))")   # 10-22: a 6 h run hit GitHub's 6 h limit and lost the night
           python tools/recorder.py --hours "$H" --every 2 --date "$DAY" --out "data/nba-$DAY.jsonl.gz" &
           python tools/feed_race.py record --hours "$H" --out "data/race-$DAY.jsonl.gz" &
           wait
