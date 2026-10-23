@@ -11,7 +11,7 @@ polls every free feed we found, side by side on one clock, every second:
 Research measurement only: nothing here alerts, sizes or places anything. The NBA's terms bar using its data
 "in connection with any gambling activity", so nba_* feeds are measured here and not wired into alerts.
 
-    python projects/sports/tools/feed_race.py record --hours 5.5 --out data/live/race-YYYYMMDD.jsonl.gz
+    python projects/sports/tools/feed_race.py record --hours 5.5 --date YYYYMMDD --out data/live/race-YYYYMMDD.jsonl.gz
     python projects/sports/tools/feed_race.py analyze data/live/race-YYYYMMDD.jsonl.gz 26OCT22
 """
 from __future__ import annotations
@@ -78,6 +78,12 @@ def pbp_last(data: dict) -> tuple[int, int, str | None] | None:
         return None
 
 
+def should_stop(games: list[dict], seen_live: bool) -> bool:
+    """Stop once every game is final, but only after this run saw a game live: in the morning ESPN's default
+    scoreboard still shows last night's finished games (2026-10-23 smoke test stopped at once)."""
+    return seen_live and bool(games) and all(g["state"] == "post" for g in games)
+
+
 def first_seen(lines: list[dict]) -> dict[tuple[str, str], dict[str, float]]:
     """(game, 'away-home') -> {source: first time that source showed that score}."""
     out: dict[tuple[str, str], dict[str, float]] = {}
@@ -131,12 +137,13 @@ def get_json(session: requests.Session, url: str, params: dict | None = None) ->
         return time.time(), None, None
 
 
-def record(hours: float, out: Path) -> None:
+def record(hours: float, out: Path, day: str | None = None) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     session = requests.Session()
     last: dict[tuple[str, str], tuple] = {}
     stop = time.time() + hours * 3600
     next_clock = 0.0
+    seen_live = False
     with gzip.open(out, "at", encoding="utf-8") as fh, ThreadPoolExecutor(max_workers=12) as pool:
         def write(src: str, game: str, t: float, **values) -> None:
             key, val = (src, game), tuple(values.values())
@@ -146,7 +153,7 @@ def record(hours: float, out: Path) -> None:
 
         while time.time() < stop:
             started = time.time()
-            f_espn = pool.submit(get_json, session, recorder.ESPN)
+            f_espn = pool.submit(get_json, session, recorder.ESPN, {"dates": day} if day else None)
             f_nba = pool.submit(get_json, session, f"{NBA}/scoreboard/todaysScoreboard_00.json")
             t_e, espn, date_hdr = f_espn.result()
             t_n, nba, _ = f_nba.result()
@@ -159,6 +166,7 @@ def record(hours: float, out: Path) -> None:
                 if g["status"] == 2:
                     write("nba_sb", g["key"], t_n, away=g["away"], home=g["home"])
             live = [g for g in eg if g["state"] == "in"]
+            seen_live = seen_live or bool(live)
             jobs = []
             for g in live:
                 for side in ("away", "home"):
@@ -189,7 +197,7 @@ def record(hours: float, out: Path) -> None:
                                      "offset_s": round(t_e - parsedate_to_datetime(date_hdr).timestamp(), 3)}) + "\n")
                 next_clock = started + 600
             fh.flush()
-            if eg and all(g["state"] == "post" for g in eg):
+            if should_stop(eg, seen_live):
                 print("every game is final; stopping", flush=True)
                 break
             time.sleep(max(0.0, EVERY - (time.time() - started)))
@@ -231,12 +239,13 @@ def main(argv: list[str] | None = None) -> None:
     r = sub.add_parser("record")
     r.add_argument("--hours", type=float, default=5.5)
     r.add_argument("--out", type=Path, required=True)
+    r.add_argument("--date", help="slate date YYYYMMDD for ESPN (default: ESPN's current day)")
     a = sub.add_parser("analyze")
     a.add_argument("path", type=Path)
     a.add_argument("date_code")
     args = ap.parse_args(argv)
     if args.cmd == "record":
-        record(args.hours, args.out)
+        record(args.hours, args.out, args.date)
     else:
         print(analyze(args.path, args.date_code))
 
