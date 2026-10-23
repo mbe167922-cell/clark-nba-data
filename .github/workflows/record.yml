@@ -63,10 +63,10 @@ jobs:
       - name: Commit the night's files (retries if main moved)
         if: always()
         run: |
-          ls data/*-"$DAY".jsonl.gz >/dev/null 2>&1 || { echo "nothing recorded"; exit 0; }
+          ls data/*-"$DAY".*gz >/dev/null 2>&1 || { echo "nothing recorded"; exit 0; }
           git config user.name "nba-recorder"
           git config user.email "nba-recorder@users.noreply.github.com"
-          mkdir -p "$RUNNER_TEMP/keep" && cp data/*-"$DAY".jsonl.gz "$RUNNER_TEMP/keep/"
+          mkdir -p "$RUNNER_TEMP/keep" && cp data/*-"$DAY".*gz "$RUNNER_TEMP/keep/"
           for attempt in 1 2 3; do
             git fetch -q origin main && git reset -q --hard origin/main
             cp "$RUNNER_TEMP"/keep/* data/
