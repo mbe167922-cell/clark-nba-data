@@ -50,23 +50,34 @@ jobs:
           echo "DAY=$DAY" >> "$GITHUB_ENV"
           H="${{ github.event.inputs.hours || '5.5' }}"
           H=$(python -c "print(min(float('$H'), 5.5))")   # 10-22: a 6 h run hit GitHub's 6 h limit and lost the night
-          python tools/recorder.py --hours "$H" --every 2 --date "$DAY" --out "data/nba-$DAY.jsonl.gz" &
-          python tools/feed_race.py record --hours "$H" --date "$DAY" --out "data/race-$DAY.jsonl.gz" &
-          wait
+          python tools/recorder.py --hours "$H" --every 2 --date "$DAY" --out "data/nba-$DAY.jsonl.gz" & P1=$!
+          python tools/feed_race.py record --hours "$H" --date "$DAY" --out "data/race-$DAY.jsonl.gz" & P2=$!
+          set +e   # a bare `wait` returns 0 even when a recorder failed: wait for each one and keep its exit code
+          wait $P1; S1=$?
+          wait $P2; S2=$?
+          echo "RECORDER_EXIT=$S1" >> "$GITHUB_ENV"
+          echo "FEED_RACE_EXIT=$S2" >> "$GITHUB_ENV"
+          echo "recorder exit $S1, feed_race exit $S2"
       - name: Pack the night's Kalshi trades (Kalshi refuses Claude's cloud, so the analyst reads them from here)
         if: always()
         env:
           PYTHONIOENCODING: utf-8
         run: |
           [ -f "data/nba-$DAY.jsonl.gz" ] || { echo "no recording"; exit 0; }
-          timeout 600 python tools/trades_bundle.py pack "data/nba-$DAY.jsonl.gz" "$DAY" "data/trades-$DAY.json.gz" || echo "trade pack failed (recording still saved)"
-      - name: Commit the night's files (retries if main moved)
+          set +e
+          timeout 600 python tools/trades_bundle.py pack "data/nba-$DAY.jsonl.gz" "$DAY" "data/trades-$DAY.json.gz"
+          S=$?
+          echo "PACK_EXIT=$S" >> "$GITHUB_ENV"
+          [ "$S" = 0 ] || echo "trade pack failed with exit $S (recording still saved)"
+      - name: Commit the night's files and this run's exit statuses (retries if main moved)
         if: always()
         run: |
-          ls data/*-"$DAY".*gz >/dev/null 2>&1 || { echo "nothing recorded"; exit 0; }
+          [ -n "$DAY" ] || DAY=$(TZ=America/New_York date -d '-6 hours' +%Y%m%d)
+          # one line per run: the nightly analyst reports any non-zero exit (null = the step never finished)
+          echo "{\"run\": \"$GITHUB_RUN_ID\", \"attempt\": \"$GITHUB_RUN_ATTEMPT\", \"ended_utc\": \"$(date -u +%FT%TZ)\", \"recorder_exit\": ${RECORDER_EXIT:-null}, \"feed_race_exit\": ${FEED_RACE_EXIT:-null}, \"pack_exit\": ${PACK_EXIT:-null}}" >> "data/status-$DAY.jsonl"
           git config user.name "nba-recorder"
           git config user.email "nba-recorder@users.noreply.github.com"
-          mkdir -p "$RUNNER_TEMP/keep" && cp data/*-"$DAY".*gz "$RUNNER_TEMP/keep/"
+          mkdir -p "$RUNNER_TEMP/keep" && cp data/*-"$DAY".* "$RUNNER_TEMP/keep/"
           for attempt in 1 2 3; do
             git fetch -q origin main && git reset -q --hard origin/main
             cp "$RUNNER_TEMP"/keep/* data/
@@ -78,3 +89,8 @@ jobs:
             sleep 10
           done
           exit 1
+      - name: Fail the run if a recorder failed (after the files and statuses are saved)
+        if: always()
+        run: |
+          echo "recorder=${RECORDER_EXIT:-none} feed_race=${FEED_RACE_EXIT:-none} pack=${PACK_EXIT:-none}"
+          [ "${RECORDER_EXIT:-1}" = 0 ] && [ "${FEED_RACE_EXIT:-1}" = 0 ] || { echo "a recorder exited non-zero"; exit 1; }
