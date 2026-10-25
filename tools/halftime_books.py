@@ -4,7 +4,6 @@ record: polls ESPN's free scoreboard every 20 s. While a game is at halftime it 
 and BetMGM moneylines from The Odds API (key from env ODDS_API_KEY; never printed or stored) and each
 halftime game's uncached Kalshi orderbook, one JSON line per call. It never places, sizes or suggests a bet.
 
-    python tools/halftime_books.py check     (free call: is the key working, credits left)
     python tools/halftime_books.py check   (free call: does the key work, credits left)
     python tools/halftime_books.py record --hours 5.5 --date 20261026 --out data/books-20261026.jsonl.gz
     python projects/sports/tools/halftime_books.py count data/live/public/books-*.jsonl.gz
