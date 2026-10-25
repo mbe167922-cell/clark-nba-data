@@ -2,6 +2,8 @@
 # side on one clock, for latency research. Public data only; nothing here places, sizes or suggests a trade.
 #   tools/recorder.py   ESPN scoreboard + each live game's Kalshi orderbook every 2 s  -> data/nba-YYYYMMDD.jsonl.gz
 #   tools/feed_race.py  ESPN scoreboard, ESPN core API, NBA live data, Kalshi orderbook every 1 s -> data/race-YYYYMMDD.jsonl.gz
+#   tools/halftime_books.py three sportsbooks' moneylines + Kalshi orderbook while a game is at halftime (NB-032, paper
+#                       research; The Odds API free key in secret ODDS_API_KEY, never printed) -> data/books-YYYYMMDD.jsonl.gz
 #   tools/trades_bundle.py  the night's Kalshi trade prints (time, price) for each recorded game -> data/trades-YYYYMMDD.json.gz
 # Each run records until every game is final (or 5.5 h) and commits the night's files; runs start six times a day.
 name: Record NBA night
@@ -20,6 +22,10 @@ on:
       hours:
         description: "hours to record (capped at 5.5: GitHub kills a job at 6 h, before it can save)"
         default: "5.5"
+      check_key:
+        description: "only check the Odds API key (free call, no recording)"
+        type: boolean
+        default: false
 
 concurrency:
   group: record
@@ -41,9 +47,16 @@ jobs:
           python-version: "3.13"
           cache: pip
       - run: pip install -r requirements.txt
-      - name: Record (both recorders in parallel)
+      - name: Check the Odds API key only (costs no credit)
+        if: ${{ github.event.inputs.check_key == 'true' }}
+        env:
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: python tools/halftime_books.py check
+      - name: Record (the recorders in parallel)
+        if: ${{ github.event.inputs.check_key != 'true' }}
         env:
           PYTHONIOENCODING: utf-8
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           # the slate's date: a run that starts after midnight ET (late or queued) still belongs to last night
           DAY=$(TZ=America/New_York date -d '-6 hours' +%Y%m%d)
@@ -52,14 +65,17 @@ jobs:
           H=$(python -c "print(min(float('$H'), 5.5))")   # 10-22: a 6 h run hit GitHub's 6 h limit and lost the night
           python tools/recorder.py --hours "$H" --every 2 --date "$DAY" --out "data/nba-$DAY.jsonl.gz" & P1=$!
           python tools/feed_race.py record --hours "$H" --date "$DAY" --out "data/race-$DAY.jsonl.gz" & P2=$!
+          python tools/halftime_books.py record --hours "$H" --date "$DAY" --out "data/books-$DAY.jsonl.gz" & P3=$!
           set +e   # a bare `wait` returns 0 even when a recorder failed: wait for each one and keep its exit code
           wait $P1; S1=$?
           wait $P2; S2=$?
+          wait $P3; S3=$?
           echo "RECORDER_EXIT=$S1" >> "$GITHUB_ENV"
           echo "FEED_RACE_EXIT=$S2" >> "$GITHUB_ENV"
-          echo "recorder exit $S1, feed_race exit $S2"
+          echo "BOOKS_EXIT=$S3" >> "$GITHUB_ENV"
+          echo "recorder exit $S1, feed_race exit $S2, halftime_books exit $S3"
       - name: Pack the night's Kalshi trades (Kalshi refuses Claude's cloud, so the analyst reads them from here)
-        if: always()
+        if: ${{ always() && github.event.inputs.check_key != 'true' }}
         env:
           PYTHONIOENCODING: utf-8
         run: |
@@ -70,11 +86,11 @@ jobs:
           echo "PACK_EXIT=$S" >> "$GITHUB_ENV"
           [ "$S" = 0 ] || echo "trade pack failed with exit $S (recording still saved)"
       - name: Commit the night's files and this run's exit statuses (retries if main moved)
-        if: always()
+        if: ${{ always() && github.event.inputs.check_key != 'true' }}
         run: |
           [ -n "$DAY" ] || DAY=$(TZ=America/New_York date -d '-6 hours' +%Y%m%d)
           # one line per run: the nightly analyst reports any non-zero exit (null = the step never finished)
-          echo "{\"run\": \"$GITHUB_RUN_ID\", \"attempt\": \"$GITHUB_RUN_ATTEMPT\", \"ended_utc\": \"$(date -u +%FT%TZ)\", \"recorder_exit\": ${RECORDER_EXIT:-null}, \"feed_race_exit\": ${FEED_RACE_EXIT:-null}, \"pack_exit\": ${PACK_EXIT:-null}}" >> "data/status-$DAY.jsonl"
+          echo "{\"run\": \"$GITHUB_RUN_ID\", \"attempt\": \"$GITHUB_RUN_ATTEMPT\", \"ended_utc\": \"$(date -u +%FT%TZ)\", \"recorder_exit\": ${RECORDER_EXIT:-null}, \"feed_race_exit\": ${FEED_RACE_EXIT:-null}, \"pack_exit\": ${PACK_EXIT:-null}, \"books_exit\": ${BOOKS_EXIT:-null}}" >> "data/status-$DAY.jsonl"
           git config user.name "nba-recorder"
           git config user.email "nba-recorder@users.noreply.github.com"
           mkdir -p "$RUNNER_TEMP/keep" && cp data/*-"$DAY".* "$RUNNER_TEMP/keep/"
@@ -90,7 +106,7 @@ jobs:
           done
           exit 1
       - name: Fail the run if a recorder failed (after the files and statuses are saved)
-        if: always()
+        if: ${{ always() && github.event.inputs.check_key != 'true' }}
         run: |
-          echo "recorder=${RECORDER_EXIT:-none} feed_race=${FEED_RACE_EXIT:-none} pack=${PACK_EXIT:-none}"
-          [ "${RECORDER_EXIT:-1}" = 0 ] && [ "${FEED_RACE_EXIT:-1}" = 0 ] || { echo "a recorder exited non-zero"; exit 1; }
+          echo "recorder=${RECORDER_EXIT:-none} feed_race=${FEED_RACE_EXIT:-none} pack=${PACK_EXIT:-none} books=${BOOKS_EXIT:-none}"
+          [ "${RECORDER_EXIT:-1}" = 0 ] && [ "${FEED_RACE_EXIT:-1}" = 0 ] && [ "${BOOKS_EXIT:-1}" = 0 ] || { echo "a recorder exited non-zero"; exit 1; }
