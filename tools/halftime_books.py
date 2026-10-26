@@ -28,6 +28,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from recorder import ESPN, ET, KALSHI, UA, espn_snapshot, fetch, home_ticker  # noqa: E402
+from trades_bundle import read_lines  # noqa: E402  (multi-member, cut-off-safe gzip reader)
 
 ODDS = "https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
 BOOKS = ("draftkings", "fanduel", "betmgm")
@@ -132,13 +133,23 @@ def book_top(data: dict) -> dict:
             "home_ask_size": best_no[1] if best_no else 0.0, "away_ask_size": best_yes[1] if best_yes else 0.0}
 
 
+def night_so_far(out: Path) -> tuple[int, float, int | None, dict[str, float]]:
+    """Earlier runs' snapshots tonight: (calls, last call time, credits left, halftime start per game).
+    The cap is per night, not per run (2026-10-26: two runs made 23 calls)."""
+    prior = [r for r in read_lines(out) if r.get("src") == "snap"] if out.exists() else []
+    prior.sort(key=lambda r: r["t"])
+    since = {g["game"]: g["ht_since"] for r in prior for g in r.get("games", [])}
+    return len(prior), (prior[-1]["t"] if prior else 0.0), (prior[-1]["remaining"] if prior else None), since
+
+
 def record(hours: float, out: Path, day: str | None, key: str) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     session = requests.Session()
     espn_params = {"dates": day} if day else {}
     date_code = (datetime.strptime(day, "%Y%m%d") if day else datetime.now(ET)).strftime("%y%b%d").upper()
     since: dict[str, float] = {}
-    calls, last_call, remaining, seen_live = 0, 0.0, None, False
+    calls, last_call, remaining, prior_since = night_so_far(out)
+    seen_live = False
     stop_at = time.time() + hours * 3600
     with gzip.open(out, "at", encoding="utf-8") as fh:
         while time.time() < stop_at:
@@ -150,7 +161,8 @@ def record(hours: float, out: Path, day: str | None, key: str) -> int:
                 half = halftime_games(data)
                 new = [g for g in half if g["id"] not in since]
                 for g in new:
-                    since[g["id"]] = started
+                    since[g["id"]] = prior_since.get(g["game"], started)
+                new = [g for g in new if g["game"] not in prior_since]
                 if should_call(started, last_call, bool(new), bool(half), calls, remaining):
                     events, remaining, used, error = fetch_odds(session, key)
                     calls, last_call = calls + 1, time.time()

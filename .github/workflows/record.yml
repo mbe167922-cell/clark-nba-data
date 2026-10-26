@@ -42,6 +42,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: main   # the latest data, not the commit this schedule fired on (a queued run lost a night's rows)
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -96,7 +97,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/keep" && cp data/*-"$DAY".* "$RUNNER_TEMP/keep/"
           for attempt in 1 2 3; do
             git fetch -q origin main && git reset -q --hard origin/main
-            cp "$RUNNER_TEMP"/keep/* data/
+            # merge, never overwrite: every row from main's copy and from this run survives (2026-10-26 fix)
+            for f in "$RUNNER_TEMP"/keep/*; do python tools/merge_night.py "data/$(basename "$f")" "data/$(basename "$f")" "$f" || cp "$f" "data/$(basename "$f").run$GITHUB_RUN_ID"; done   # merge failed: keep this run's copy beside it
             git add data/
             git diff --cached --quiet && { echo "nothing changed"; exit 0; }
             git commit -q -m "Recording $DAY ($(TZ=America/New_York date '+%Y-%m-%d %H:%M') ET)"
