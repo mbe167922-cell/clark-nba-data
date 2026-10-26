@@ -40,10 +40,12 @@ def merge_trades(*packs: dict) -> dict:
     return {t: sorted(p, key=lambda x: x[0], reverse=True) for t, p in out.items()}   # newest first, as packed
 
 
-def read(path: Path) -> list[dict] | dict:
-    if path.name.startswith("trades-"):
+def read(path: Path, like: Path | None = None) -> list[dict] | dict:
+    """Read a copy in the format of `like` (the destination), whatever the copy's own name is."""
+    like = like or path
+    if like.name.startswith("trades-"):
         return json.loads(gzip.decompress(path.read_bytes()))
-    if path.suffix == ".gz":
+    if like.suffix == ".gz":
         return read_lines(path)
     return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
 
@@ -61,7 +63,7 @@ def write(path: Path, merged: list[dict] | dict) -> None:
 
 def merge_files(out: Path, copies: list[Path]) -> int:
     """Merge the existing copies into `out`; returns the number of rows (or tickers) written."""
-    data = [read(p) for p in copies if p.exists()]
+    data = [read(p, like=out) for p in copies if p.exists()]
     if not data:
         return 0
     merged = merge_trades(*data) if isinstance(data[0], dict) else merge_lines(*data)
