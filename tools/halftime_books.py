@@ -9,7 +9,8 @@ halftime game's uncached Kalshi orderbook, one JSON line per call. It never plac
     python projects/sports/tools/halftime_books.py count data/live/public/books-*.jsonl.gz
     python projects/sports/tools/halftime_books.py grade data/live/public   (only at the pre-registered stop)
 
-Each line: {"t", "src": "snap", "remaining", "used", "error", "events": [book odds], "games": [halftime games]}.
+Each line: {"t", "src": "snap", "remaining", "used", "error", "events": [book odds], "games": [halftime games]},
+or {"t", "src": "ht", "game"} the first time a run sees a game at halftime (later runs keep that anchor).
 """
 from __future__ import annotations
 
@@ -39,6 +40,7 @@ MAX_CALLS = 16             # per night: ~30 nights fit the free 500 credits a mo
 CREDIT_FLOOR = 25
 
 # pre-registered grading constants (PREREG-NB-032)
+FIRST_NIGHT = "20261026"   # "collected from 2026-10-26 on"
 MAX_AGE_S = 60
 SENSITIVITY_AGE_S = 300
 MAX_DISPERSION = 0.03
@@ -134,11 +136,16 @@ def book_top(data: dict) -> dict:
 
 
 def night_so_far(out: Path) -> tuple[int, float, int | None, dict[str, float]]:
-    """Earlier runs' snapshots tonight: (calls, last call time, credits left, halftime start per game).
-    The cap is per night, not per run (2026-10-26: two runs made 23 calls)."""
-    prior = [r for r in read_lines(out) if r.get("src") == "snap"] if out.exists() else []
-    prior.sort(key=lambda r: r["t"])
-    since = {g["game"]: g["ht_since"] for r in prior for g in r.get("games", [])}
+    """Earlier runs' rows tonight: (calls, last call time, credits left, first halftime sighting per game).
+    The cap is per night, not per run (2026-10-26: two runs made 23 calls). The anchor is the earliest any run
+    saw, from its snapshots or its 'ht' rows (a run can see a halftime and end before its first call)."""
+    rows = read_lines(out) if out.exists() else []
+    prior = sorted((r for r in rows if r.get("src") == "snap"), key=lambda r: r["t"])
+    sightings = [(g["game"], g["ht_since"]) for r in prior for g in r.get("games", [])]
+    sightings += [(r["game"], r["t"]) for r in rows if r.get("src") == "ht"]
+    since: dict[str, float] = {}
+    for game, t in sightings:
+        since[game] = min(t, since.get(game, t))
     return len(prior), (prior[-1]["t"] if prior else 0.0), (prior[-1]["remaining"] if prior else None), since
 
 
@@ -162,6 +169,9 @@ def record(hours: float, out: Path, day: str | None, key: str) -> int:
                 new = [g for g in half if g["id"] not in since]
                 for g in new:
                     since[g["id"]] = prior_since.get(g["game"], started)
+                    if g["game"] not in prior_since:   # written now: this run may end before its next call
+                        fh.write(json.dumps({"t": round(started, 3), "src": "ht", "game": g["game"]}) + "\n")
+                        fh.flush()
                 new = [g for g in new if g["game"] not in prior_since]
                 if should_call(started, last_call, bool(new), bool(half), calls, remaining):
                     events, remaining, used, error = fetch_odds(session, key)
@@ -206,13 +216,23 @@ def nickname(name: str | None) -> str:
     return (name or "").split()[-1].lower() if name else ""
 
 
-def match_event(game: dict, events: list[dict]) -> dict | None:
+def match_event(game: dict, events: list[dict], at: float) -> dict | None:
+    """The books' event with the same home and away teams that had started by `at`. A swapped home/away listing
+    never matches, and a later game between the same teams (the API lists days ahead) is never taken."""
     return next((e for e in events if nickname(e["home"]) == nickname(game.get("home_name"))
-                 and nickname(e["away"]) == nickname(game.get("away_name"))), None)
+                 and nickname(e["away"]) == nickname(game.get("away_name")) and started_by(e, at)), None)
 
 
 def iso_ts(value: str) -> float:
     return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def started_by(event: dict, at: float) -> bool:
+    """False only when the event's commence time is known and after `at`."""
+    try:
+        return iso_ts(event["commence"]) <= at
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return True
 
 
 def reference(event: dict | None, at: float, max_age: float) -> tuple[float | None, str]:
@@ -243,8 +263,13 @@ def side_quote(game: dict, side: str) -> tuple[float, float, float] | None:
     return round(1 - ask, 4), round(1 - bid, 4), game.get("away_ask_size", 0.0)
 
 
+def clears_threshold(ref: float, ask: float, spread: float, fee) -> bool:
+    """The pre-registered entry threshold: reference(side) - ask >= 2 fees + spread + 3c."""
+    return ref - ask >= 2 * fee(ask, N_CONTRACTS) + spread + EDGE_MARGIN - 1e-9
+
+
 def entry_signal(game: dict, ref_home: float, fee) -> dict | None:
-    """The pre-registered entry: reference(side) - ask >= 2 fees + spread + 3c, spread <= 2c, >= 10 at the ask."""
+    """The pre-registered entry: the threshold on a side, spread <= 2c, >= 10 at the ask, within 13:00 of halftime."""
     if game.get("bid") is None or game.get("ask") is None or game["t"] - game["ht_since"] > ENTRY_WINDOW_S:
         return None
     spread = game["ask"] - game["bid"]
@@ -252,9 +277,16 @@ def entry_signal(game: dict, ref_home: float, fee) -> dict | None:
         return None
     for side, ref in (("home", ref_home), ("away", 1 - ref_home)):
         bid, ask, size = side_quote(game, side)
-        if size >= MIN_SIZE and ref - ask >= 2 * fee(ask, N_CONTRACTS) + spread + EDGE_MARGIN - 1e-9:
+        if size >= MIN_SIZE and clears_threshold(ref, ask, spread, fee):
             return {"side": side, "ask": ask, "ref": ref, "t": game["t"]}
     return None
+
+
+def above_threshold(game: dict, ref_home: float, fee) -> bool:
+    """Descriptive: either side clears the entry threshold (spread, size and the 13:00 window not applied)."""
+    spread = game["ask"] - game["bid"]
+    return any(clears_threshold(ref, side_quote(game, side)[1], spread, fee)
+               for side, ref in (("home", ref_home), ("away", 1 - ref_home)))
 
 
 def game_key(game: dict) -> str:
@@ -274,33 +306,56 @@ def clock_s(clock: str | None) -> float | None:
         return None
 
 
-def recorder_index(lines: list[dict]) -> tuple[dict, dict, set]:
-    """Recorder file -> per game: (time of 3:00 into Q3), home book rows [(t, bid, ask)], games that reached final."""
-    from latency import kalshi_code
-    q3_stop, books, final = {}, {}, set()
+def home_won(row: dict) -> bool | None:
+    from latency import to_float
+    home, away = to_float(row.get("home_score")), to_float(row.get("away_score"))
+    return home > away if home is not None and away is not None else None
+
+
+def recorder_index(lines: list[dict]) -> tuple[dict, dict, dict, set]:
+    """Recorder file -> per game: time of 3:00 into Q3; home book rows [(t, bid, ask)], a missing side as None;
+    home_won (None if unreadable) for games that reached final; games called off ('post' before period 4)."""
+    from latency import kalshi_code, to_float
+    q3_stop, books, final, called_off = {}, {}, {}, set()
     for x in lines:
         if x["src"] == "espn":
             for g in x["rows"]:
                 key = kalshi_code(g["away"]) + kalshi_code(g["home"])
                 if g["state"] == "post":
-                    final.add(key)
+                    if isinstance(g.get("period"), int) and g["period"] < 4:
+                        called_off.add(key)
+                    else:
+                        final[key] = home_won(g)
                 c = clock_s(g.get("clock"))
-                if key not in q3_stop and g.get("period") == 3 and c is not None and c <= Q3_STOP_CLOCK_S:
+                # c > 0: ESPN shows 'P3 0.0' around the Q3 tip, before the clock resets to 12:00 (3 of 29 games by 10-25)
+                if key not in q3_stop and g.get("period") == 3 and c is not None and 0 < c <= Q3_STOP_CLOCK_S:
                     q3_stop[key] = x["t"]
         elif x["src"] == "book":
             for r in x["rows"]:
-                if r.get("bid") and r.get("ask"):
-                    books.setdefault(r["ticker"].split("-")[1][7:], []).append((r.get("t", x["t"]), float(r["bid"]), float(r["ask"])))
-    return q3_stop, books, final
+                books.setdefault(r["ticker"].split("-")[1][7:], []).append(
+                    (r.get("t", x["t"]), to_float(r.get("bid")), to_float(r.get("ask"))))
+    return q3_stop, books, final, called_off
 
 
-def time_stop_quote(key: str, q3_stop: dict, books: dict) -> tuple[float, float] | None:
-    """Home (bid, ask) in the first recorder book row at or after 3:00 into Q3, within 30 s."""
+def time_stop_quote(key: str, q3_stop: dict, books: dict) -> tuple[float | None, float | None] | None:
+    """Home (bid, ask) in the first recorder book row at or after 3:00 into Q3, within 30 s. The row is taken as it
+    is, a missing side as None: the pre-registered exit is that first row's bid, never a later row's."""
     t0 = q3_stop.get(key)
     if t0 is None:
         return None
-    row = next((r for r in sorted(books.get(key, [])) if t0 <= r[0] <= t0 + EXIT_MATCH_S), None)
+    row = next((r for r in sorted(books.get(key, []), key=lambda r: r[0]) if t0 <= r[0] <= t0 + EXIT_MATCH_S), None)
     return (row[1], row[2]) if row else None
+
+
+def in_sample(snaps: list[dict]) -> list[dict]:
+    """The pre-registered sample: nights from FIRST_NIGHT on, at most MAX_CALLS calls per night (the first ones).
+    Night 20261025 predates it and made 23 calls in two runs, before the cap was per night."""
+    kept, calls = [], {}
+    for s in sorted(snaps, key=lambda s: s["t"]):
+        calls[s["night"]] = calls.get(s["night"], 0) + 1
+        if s["night"] >= FIRST_NIGHT and calls[s["night"]] <= MAX_CALLS:
+            kept.append(s)
+    return kept
 
 
 def by_game(snaps: list[dict]) -> dict[tuple[str, str], list[tuple[dict, dict]]]:
@@ -314,22 +369,28 @@ def by_game(snaps: list[dict]) -> dict[tuple[str, str], list[tuple[dict, dict]]]
 
 def valid_halftimes(snaps: list[dict], max_age: float = MAX_AGE_S) -> int:
     """The pre-registered sample count: games with at least one valid snapshot (no prices looked at)."""
-    return sum(1 for rows in by_game(snaps).values()
-               if any(reference(match_event(g, s["events"]), s["t"], max_age)[0] is not None for s, g in rows))
+    return sum(1 for rows in by_game(in_sample(snaps)).values()
+               if any(reference(match_event(g, s["events"], s["t"]), s["t"], max_age)[0] is not None for s, g in rows))
 
 
 def simulate(snaps: list[dict], recordings: dict[str, list[dict]], max_age: float, fee) -> dict:
-    """H1 paper trades, H2 rows and descriptive counts for one staleness setting."""
+    """H1 paper trades, H2 rows and descriptive counts for one staleness setting. A game is excluded only when its
+    recorder shows it called off; a missing or cut-short recording keeps it (halftime exits need no recorder)."""
     index = {night: recorder_index(lines) for night, lines in recordings.items()}
-    trades, h2, gaps, reasons, ungradable, excluded = [], [], [], {}, 0, 0
-    for (night, key), rows in by_game(snaps).items():
-        q3_stop, books, final = index.get(night, ({}, {}, set()))
-        if key not in final:
+    trades, h2, gaps, brier, reasons, ungradable_why, excluded, above = [], [], [], [], {}, {}, 0, 0
+    coverage = {"recorder missing": 0, "recorder ended before final": 0}
+    for (night, key), rows in by_game(in_sample(snaps)).items():
+        q3_stop, books, final, called_off = index.get(night, ({}, {}, {}, set()))
+        if key in called_off and key not in final:
             excluded += 1
             continue
+        if night not in index:
+            coverage["recorder missing"] += 1
+        elif key not in final:
+            coverage["recorder ended before final"] += 1
         valid = []
         for s, g in rows:
-            ref, why = reference(match_event(g, s["events"]), s["t"], max_age)
+            ref, why = reference(match_event(g, s["events"], s["t"]), s["t"], max_age)
             reasons[why] = reasons.get(why, 0) + 1
             if ref is not None and g.get("bid") is not None and g.get("ask") is not None:
                 valid.append((s, g, ref))
@@ -339,10 +400,14 @@ def simulate(snaps: list[dict], recordings: dict[str, list[dict]], max_age: floa
         first_s, first_g, first_ref = valid[0]
         mid0 = (first_g["bid"] + first_g["ask"]) / 2
         gaps.append(abs(first_ref - mid0))
-        if stop:
+        above += above_threshold(first_g, first_ref, fee)
+        if final.get(key) is not None:
+            brier.append((first_ref, mid0, float(final[key])))
+        if stop and None not in stop:
             h2.append((first_ref - mid0, (stop[0] + stop[1]) / 2 - mid0, night))
+        since = min(g["ht_since"] for _, g in rows)   # the first sighting: a restarted run stamped a later one (10-25)
         for i, (s, g, ref) in enumerate(valid):
-            signal = entry_signal(g, ref, fee)
+            signal = entry_signal({**g, "ht_since": since}, ref, fee)
             if not signal:
                 continue
             exit_bid, why = None, "time stop"
@@ -356,14 +421,17 @@ def simulate(snaps: list[dict], recordings: dict[str, list[dict]], max_age: floa
                     exit_bid, why = bid2, "reference moved"
                     break
             if exit_bid is None and stop:
-                exit_bid = stop[0] if signal["side"] == "home" else round(1 - stop[1], 4)
+                exit_bid = stop[0] if signal["side"] == "home" else None if stop[1] is None else round(1 - stop[1], 4)
             if exit_bid is None:
-                ungradable += 1
+                cause = "no time-stop row" if not stop else "no bid on its side at the time stop"
+                ungradable_why[cause] = ungradable_why.get(cause, 0) + 1
             else:
                 pnl = exit_bid - signal["ask"] - fee(signal["ask"], N_CONTRACTS) - fee(exit_bid, N_CONTRACTS)
                 trades.append({"night": night, "game": key, **signal, "exit": exit_bid, "why": why, "pnl": pnl})
             break  # one entry per game
-    return {"trades": trades, "h2": h2, "gaps": gaps, "reasons": reasons, "ungradable": ungradable, "excluded": excluded}
+    return {"trades": trades, "h2": h2, "gaps": gaps, "brier": brier, "above": above, "reasons": reasons,
+            "ungradable": sum(ungradable_why.values()), "ungradable_why": ungradable_why, "excluded": excluded,
+            "coverage": coverage}
 
 
 def cluster_bootstrap(rows: list, stat, cluster, n_boot: int = 10_000, seed: int = 13) -> list[float]:
@@ -389,10 +457,13 @@ def slope(rows: list[tuple[float, float, str]]) -> float | None:
     return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx if sxx else None
 
 
-def verdict_h1(trades: list[dict]) -> dict:
-    n = len(trades)
-    if n < MIN_ENTRIES:
-        return {"n": n, "verdict": "KILL", "why": f"{n} entries < {MIN_ENTRIES} (too rare)"}
+def verdict_h1(trades: list[dict], ungradable: int) -> dict:
+    """The frequency gate counts every entry, ungradable ones too ("counted, not dropped"); P&L uses the graded."""
+    n, entries = len(trades), len(trades) + ungradable
+    if entries < MIN_ENTRIES:
+        return {"entries": entries, "n": n, "verdict": "KILL", "why": f"{entries} entries < {MIN_ENTRIES} (too rare)"}
+    if not trades:
+        return {"entries": entries, "n": 0, "verdict": "n/a", "why": "no graded trade"}
     pnls = [t["pnl"] for t in trades]
     mean = statistics.fmean(pnls)
     boot = cluster_bootstrap(trades, lambda s: statistics.fmean(t["pnl"] for t in s) if s else None, lambda t: t["night"])
@@ -407,7 +478,7 @@ def verdict_h1(trades: list[dict]) -> dict:
         verdict = "SURVIVES"
     else:
         verdict = "FRAGILE"
-    return {"n": n, "mean": mean, "lo": lo, "hi": hi, "p": p, "halves": halves, "verdict": verdict}
+    return {"entries": entries, "n": n, "mean": mean, "lo": lo, "hi": hi, "p": p, "halves": halves, "verdict": verdict}
 
 
 def verdict_h2(rows: list[tuple[float, float, str]]) -> dict:
@@ -419,21 +490,42 @@ def verdict_h2(rows: list[tuple[float, float, str]]) -> dict:
     return {"n": len(rows), "slope": b, "lo": lo, "hi": hi, "verdict": "SURVIVES" if lo > 0 else "KILL"}
 
 
+def gap_line(gaps: list[float]) -> str:
+    if not gaps:
+        return "- |reference - Kalshi mid| at first valid snapshot: n=0"
+    q1, med, q3 = statistics.quantiles(gaps, n=4, method="inclusive") if len(gaps) > 1 else gaps * 3
+    return (f"- |reference - Kalshi mid| at first valid snapshot: n={len(gaps)}, p25 {q1 * 100:.1f}c, median "
+            f"{med * 100:.1f}c, p75 {q3 * 100:.1f}c, max {max(gaps) * 100:.1f}c")
+
+
+def brier_line(rows: list[tuple[float, float, float]]) -> str:
+    """Home-team Brier of the reference and of the Kalshi mid on the same snapshots (first valid one per final game)."""
+    if not rows:
+        return "- Brier (home team, first valid snapshot of each final game): n=0"
+    ref, mid = (statistics.fmean((r[i] - r[2]) ** 2 for r in rows) for i in (0, 1))
+    return f"- Brier (home team, first valid snapshot of each final game, n={len(rows)}): reference {ref:.4f} vs Kalshi mid {mid:.4f}"
+
+
 def grade(folder: Path) -> str:
     from calibration import fee_per_contract
     from latency import load
-    snaps = load_snaps(sorted(folder.glob("books-*.jsonl.gz")))
-    nights = {s["night"] for s in snaps}
-    recordings = {n: load(folder / f"nba-{n}.jsonl.gz") for n in nights if (folder / f"nba-{n}.jsonl.gz").exists()}
+    snaps = in_sample(load_snaps(sorted(folder.glob("books-*.jsonl.gz"))))
+    nights = sorted({s["night"] for s in snaps})
+    missing = [n for n in nights if not (folder / f"nba-{n}.jsonl.gz").exists()]
+    recordings = {n: load(folder / f"nba-{n}.jsonl.gz") for n in nights if n not in missing}
     main = simulate(snaps, recordings, MAX_AGE_S, fee_per_contract)
     sens = simulate(snaps, recordings, SENSITIVITY_AGE_S, fee_per_contract)
-    h1, h1s, h2 = verdict_h1(main["trades"]), verdict_h1(sens["trades"]), verdict_h2(main["h2"])
-    gaps = sorted(main["gaps"])
-    lines = [f"# NB-032 grading ({len(nights)} nights, {valid_halftimes(snaps)} valid halftimes; PREREG-NB-032)", "",
-             f"- H1: {h1}", f"- H1s (300 s): {h1s}", f"- H2: {h2}",
-             f"- |reference - Kalshi mid| at first valid snapshot: n={len(gaps)}, median "
-             f"{statistics.median(gaps) * 100 if gaps else float('nan'):.1f}c, max {max(gaps, default=0) * 100:.1f}c",
-             f"- snapshot validity: {main['reasons']}; ungradable trades {main['ungradable']}; games not final {main['excluded']}"]
+    h1, h1s = verdict_h1(main["trades"], main["ungradable"]), verdict_h1(sens["trades"], sens["ungradable"])
+    h2 = verdict_h2(main["h2"])
+    lines = [f"# NB-032 grading ({len(nights)} nights from {FIRST_NIGHT}, {valid_halftimes(snaps)} valid halftimes; "
+             f"PREREG-NB-032)", "",
+             f"- H1: {h1}", f"- H1s (300 s): {h1s}", f"- H2: {h2}", gap_line(main["gaps"]),
+             f"- share above the entry threshold (first valid snapshot; either side's reference - ask >= 2 fees + spread"
+             f" + 3c; spread, size and 13:00 window not applied): {main['above']}/{len(main['gaps'])}",
+             brier_line(main["brier"]),
+             f"- snapshot validity: {main['reasons']}; ungradable trades {main['ungradable_why']} (H1s "
+             f"{sens['ungradable_why']}); games called off {main['excluded']}; {main['coverage']}"
+             + (f"; no recorder file for {', '.join(missing)}" if missing else "")]
     return "\n".join(lines) + "\n"
 
 

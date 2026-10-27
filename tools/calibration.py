@@ -9,8 +9,12 @@ Commands (run from the repo root):
 
 Pre-game price rule: the last trade print at or before (market close_time - 5h). For finished game
 markets close_time is when the winner was declared (~game end), and games last 2.3-3.5h, so
-close - 5h is before the start. Sensitivity: close - 3.5h on a random subset (`--sens`), and an
+close - 5h is usually before the start. Sensitivity: close - 3.5h on a random subset (`--sens`), and an
 "ask-side" price (last print where the taker bought YES, i.e. paid the ask).
+Start-time guard (data quality, not a rule change): when Kalshi closes a market late, close - 5h lands
+in the game or after the final, so a row is used only if its last print is before the scheduled start
+(MLB ticker time, NBA ESPN tip). NHL/NFL tickers carry no time: there a last price within 2c of 0 or 1
+counts as already decided and is dropped.
 """
 from __future__ import annotations
 
@@ -39,6 +43,7 @@ WINDOW_HOURS = 3.0       # "recent" window used for the liquidity filter
 MIN_PRINTS = 10          # need at least this many prints in the window
 MAX_STALE_HOURS = 2.0    # last print must be within this many hours of the cutoff
 EXCHANGE_FEE = 0.01      # per contract, official fee PDF effective 2026-06-01
+DECIDED = 0.02           # with no start time, a last price this close to 0 or 1 is taken as post-final
 BUCKETS = [(0.0, 0.30, "<0.30"), (0.30, 0.50, "0.30-0.50"), (0.50, 0.60, "0.50-0.60"),
            (0.60, 0.70, "0.60-0.70"), (0.70, 0.80, "0.70-0.80"), (0.80, 0.90, "0.80-0.90"),
            (0.90, 0.95, "0.90-0.95"), (0.95, 1.01, ">=0.95")]
@@ -127,7 +132,7 @@ def summarize(rows: list[tuple[float, bool]], n_contracts: int = 10, gold: bool 
 
 
 def pick_prices(trades: list[dict], cutoff: datetime) -> dict | None:
-    """From prints at or before `cutoff` (newest first) return last price, ask-side price, print count.
+    """From prints at or before `cutoff` (newest first) return last price, ask-side price, print count, last print time.
 
     Returns None when the market is too thin: fewer than MIN_PRINTS in the window, or last print stale.
     """
@@ -142,7 +147,15 @@ def pick_prices(trades: list[dict], cutoff: datetime) -> dict | None:
     if len(in_window) < MIN_PRINTS:
         return None
     ask = next((p[1] for p in in_window if p[2] == "yes"), None)
-    return {"last": prints[0][1], "ask": ask, "n_window": len(in_window)}
+    return {"last": prints[0][1], "ask": ask, "n_window": len(in_window), "t": prints[0][0]}
+
+
+def is_pregame(picked: dict, start: datetime | None) -> bool:
+    """True if the picked price can be a pre-game price. With a scheduled start, the last print must come before it
+    (real starts come ~10 min later, so this is conservative); without one, only an already-decided price is rejected."""
+    if start is not None:
+        return picked["t"] < start
+    return DECIDED < picked["last"] < 1 - DECIDED
 
 
 def mlb_start_from_ticker(event_ticker: str) -> datetime | None:
@@ -287,8 +300,28 @@ def cmd_startcheck(limit: int) -> None:
 
 # ---------- analysis ----------
 
-def load_rows(hours_tag: str, price_key: str) -> list[dict]:
+def scheduled_starts(games: list[dict]) -> dict[str, datetime]:
+    """Market ticker -> scheduled start (UTC): MLB from the ticker, NBA from the cached ESPN scoreboards.
+    NHL and NFL tickers carry no time, so those markets are absent."""
+    import nba_edges  # imported here because nba_edges imports this module
+    espn, _ = nba_edges.load_espn()
+    starts = {}
+    for g in games:
+        start = None
+        if g["league"] == "MLB":
+            start = mlb_start_from_ticker(g["event_ticker"])
+        elif g["league"] == "NBA" and (parsed := nba_edges.parse_ticker(g["ticker"])):
+            start = espn.get(parsed[:3], {}).get("tip")
+        if start:
+            starts[g["ticker"]] = start
+    return starts
+
+
+def load_rows(hours_tag: str, price_key: str, starts: dict[str, datetime] | None = None) -> list[dict]:
+    """One row per cached market; price None if thin/stale, and also (after_start) if the print is not pre-game."""
     games = {g["ticker"]: g for g in all_games(10**9)}
+    if starts is None:
+        starts = scheduled_starts(list(games.values()))
     rows = []
     for ticker, g in games.items():
         path = trades_cache(g, hours_tag)
@@ -299,6 +332,9 @@ def load_rows(hours_tag: str, price_key: str) -> list[dict]:
         picked = pick_prices(json.loads(path.read_text(encoding="utf-8")), cutoff)
         if picked is None or picked[price_key] is None:
             rows.append({**g, "fetched": True, "price": None})
+            continue
+        if not is_pregame(picked, starts.get(ticker)):
+            rows.append({**g, "fetched": True, "price": None, "after_start": True})
             continue
         rows.append({**g, "fetched": True, "price": picked[price_key], "n_window": picked["n_window"],
                      "won": g["result"] == "yes"})
@@ -326,9 +362,16 @@ def print_table(title: str, tab: list[dict]) -> None:
 
 
 def cmd_analyze() -> None:
-    rows = load_rows("c5", "last")
+    starts = scheduled_starts(all_games(10**9))
+    rows = load_rows("c5", "last", starts)
     used = [r for r in rows if r["price"] is not None]
-    print(f"fetched {len(rows)}; usable (liquid, fresh) {len(used)}; thin/stale {len(rows) - len(used)}")
+    late = [r for r in rows if r.get("after_start")]
+    print(f"fetched {len(rows)}; usable (liquid, fresh, pre-game) {len(used)}; thin/stale {len(rows) - len(used) - len(late)}; "
+          f"printed at/after the scheduled start or already decided {len(late)}")
+    for league in SERIES:
+        part = [r for r in used + late if r["league"] == league]
+        print(f"  {league}: start time known for {sum(r['ticker'] in starts for r in part)} of {len(part)}; "
+              f"dropped by the start-time guard {sum(1 for r in late if r['league'] == league)}")
     for league in [*SERIES, "ALL"]:
         n = sum(1 for r in used if league == "ALL" or r["league"] == league)
         print(league, "usable", n)
@@ -347,9 +390,9 @@ def cmd_analyze() -> None:
         s = summarize([(r["price"], r["won"]) for r in part])
         print(f"time split {name} ({part[0]['close_time'][:10]}..{part[-1]['close_time'][:10]}): n={s['n']} "
               f"win={s['win_rate']:.3f} px={s['mean_price']:.3f} ROI={s['roi']:+.1%} [{s['roi_lo']:+.1%},{s['roi_hi']:+.1%}]")
-    ask = [r for r in load_rows("c5", "ask") if r["price"] is not None]
+    ask = [r for r in load_rows("c5", "ask", starts) if r["price"] is not None]
     print_table("SENSITIVITY: ask-side price (last print where taker bought YES), c5", [t for t in table(ask) if t["league"] == "ALL"])
-    s35 = [r for r in load_rows("c35", "last") if r["price"] is not None]
+    s35 = [r for r in load_rows("c35", "last", starts) if r["price"] is not None]
     print(f"\nSENSITIVITY c35 subset usable n={len(s35)}")
     print_table("SENSITIVITY: last print <= close-3.5h (random subset)", [t for t in table(s35) if t["league"] == "ALL"])
     # same-subset comparison for c5
