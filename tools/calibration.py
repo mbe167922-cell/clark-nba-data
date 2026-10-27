@@ -303,18 +303,29 @@ def cmd_startcheck(limit: int) -> None:
 def scheduled_starts(games: list[dict]) -> dict[str, datetime]:
     """Market ticker -> scheduled start (UTC): MLB from the ticker, NBA from the cached ESPN scoreboards.
     NHL and NFL tickers carry no time, so those markets are absent."""
-    import nba_edges  # imported here because nba_edges imports this module
-    espn, _ = nba_edges.load_espn()
-    starts = {}
+    starts, nba = {}, None
     for g in games:
         start = None
         if g["league"] == "MLB":
             start = mlb_start_from_ticker(g["event_ticker"])
-        elif g["league"] == "NBA" and (parsed := nba_edges.parse_ticker(g["ticker"])):
-            start = espn.get(parsed[:3], {}).get("tip")
+        elif g["league"] == "NBA":
+            nba = nba or nba_tips()
+            if parsed := nba[0](g["ticker"]):
+                start = nba[1].get(parsed[:3], {}).get("tip")
         if start:
             starts[g["ticker"]] = start
     return starts
+
+
+def nba_tips() -> tuple:
+    """(ticker parser, cached ESPN games) from nba_edges.py, which only the private repo has. Without it NBA markets
+    have no start time, and skipping the pre-game guard would let in-game prints in: fail instead."""
+    try:
+        import nba_edges  # imported here because nba_edges imports this module
+    except ImportError as e:
+        raise RuntimeError("NBA start times need nba_edges.py and its cached ESPN scoreboards (private repo only); "
+                           "the pre-game guard cannot run without them") from e
+    return nba_edges.parse_ticker, nba_edges.load_espn()[0]
 
 
 def load_rows(hours_tag: str, price_key: str, starts: dict[str, datetime] | None = None) -> list[dict]:
